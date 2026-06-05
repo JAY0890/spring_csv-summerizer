@@ -1,0 +1,13 @@
+spring:
+  application:
+    name: csvsummerizer
+  servlet:
+    multipart:
+      max-file-size: 10MB
+      max-request-size: 10MB
+
+# Gemini configuration
+gemini:
+  api-key: ${GOOGLEAI}
+  model-name: gemini-flash-lite-latest
+  embedding-model-name: "gemini-embedding-2"
