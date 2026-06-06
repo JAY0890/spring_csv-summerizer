@@ -60,23 +60,45 @@ public class CsvRagService {
                 throw new IllegalArgumentException("CSV file is empty or has no headers");
             }
 
-            // Read data rows and convert to TextSegments
+            // Read data rows and convert to TextSegments in chunks
             String[] row;
             int rowNumber = 0;
+            
+            StringBuilder chunkContent = new StringBuilder();
+            int rowsInChunk = 0;
+            int chunkStartRow = 1;
+
             while ((row = reader.readNext()) != null) {
                 rowNumber++;
+                if (rowsInChunk == 0) {
+                    chunkStartRow = rowNumber;
+                }
+                
                 String content = buildRowContent(headers, row);
+                chunkContent.append("Row ").append(rowNumber).append(": ").append(content).append("\n");
+                rowsInChunk++;
 
+                // Create a segment for every 10 rows
+                if (rowsInChunk == 10) {
+                    Metadata metadata = new Metadata();
+                    metadata.put("source", filename);
+                    metadata.put("row_range", chunkStartRow + "-" + rowNumber);
+
+                    TextSegment segment = TextSegment.from(chunkContent.toString(), metadata);
+                    segments.add(segment);
+
+                    chunkContent = new StringBuilder(); // Reset for next chunk
+                    rowsInChunk = 0;
+                }
+            }
+
+            // Add any remaining rows as the last segment
+            if (rowsInChunk > 0) {
                 Metadata metadata = new Metadata();
                 metadata.put("source", filename);
-                metadata.put("row", rowNumber);
+                metadata.put("row_range", chunkStartRow + "-" + rowNumber);
 
-                // Also add each column value as metadata for structured queries
-                for (int i = 0; i < headers.length && i < row.length; i++) {
-                    metadata.put(headers[i].trim(), row[i].trim());
-                }
-
-                TextSegment segment = TextSegment.from(content, metadata);
+                TextSegment segment = TextSegment.from(chunkContent.toString(), metadata);
                 segments.add(segment);
             }
 
@@ -137,7 +159,7 @@ public class CsvRagService {
         context.append("Here is the relevant data from the CSV file:\n\n");
         for (int i = 0; i < matches.size(); i++) {
             EmbeddingMatch<TextSegment> match = matches.get(i);
-            context.append("Row ").append(i + 1).append(": ")
+            context.append("--- Data Block ").append(i + 1).append(" ---\n")
                     .append(match.embedded().text())
                     .append("\n");
         }
