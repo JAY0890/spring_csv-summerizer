@@ -43,66 +43,83 @@ public class CustomGeminiEmbeddingModel implements EmbeddingModel {
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_JSON);
 
-        for (TextSegment segment : textSegments) {
-            Map<String, Object> body = new HashMap<>();
+        try (var executor = java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor()) {
+            List<java.util.concurrent.Future<Embedding>> futures = new ArrayList<>();
             
-            Map<String, Object> content = new HashMap<>();
-            List<Map<String, Object>> parts = new ArrayList<>();
-            parts.add(Map.of("text", segment.text()));
-            content.put("parts", parts);
-            
-            body.put("content", content);
+            for (TextSegment segment : textSegments) {
+                futures.add(executor.submit(() -> {
+                    Map<String, Object> body = new HashMap<>();
+                    
+                    Map<String, Object> content = new HashMap<>();
+                    List<Map<String, Object>> parts = new ArrayList<>();
+                    parts.add(Map.of("text", segment.text()));
+                    content.put("parts", parts);
+                    
+                    body.put("content", content);
 
-            int retries = 0;
-            boolean success = false;
-            
-            while (!success && retries < 3) {
-                try {
-                    HttpEntity<Map<String, Object>> entity = new HttpEntity<>(body, headers);
-                    String responseStr = restTemplate.postForObject(url, entity, String.class);
+                    int retries = 0;
+                    boolean success = false;
+                    Embedding resultEmbedding = null;
                     
-                    JsonNode root = objectMapper.readTree(responseStr);
-                    JsonNode embeddingNode = root.path("embedding");
-                    
-                    if (embeddingNode.isObject()) {
-                        JsonNode valuesNode = embeddingNode.path("values");
-                        if (valuesNode.isArray()) {
-                            float[] vector = new float[valuesNode.size()];
-                            for (int i = 0; i < valuesNode.size(); i++) {
-                                vector[i] = (float) valuesNode.get(i).asDouble();
-                            }
-                            allEmbeddings.add(Embedding.from(vector));
-                        }
-                    } else {
-                        throw new RuntimeException("Failed to extract embedding from Gemini response: " + responseStr);
-                    }
-                    
-                    success = true;
-                    // Add a small delay to avoid hitting rate limits too quickly
-                    Thread.sleep(100);
-                    
-                } catch (org.springframework.web.client.HttpStatusCodeException e) {
-                    if (e.getStatusCode().value() == 429) {
-                        retries++;
-                        log.warn("Rate limit hit (429)! Waiting 16 seconds before retry {}/3...", retries);
+                    while (!success && retries < 3) {
                         try {
-                            Thread.sleep(16000);
-                        } catch (InterruptedException ie) {
-                            Thread.currentThread().interrupt();
+                            HttpEntity<Map<String, Object>> entity = new HttpEntity<>(body, headers);
+                            String responseStr = restTemplate.postForObject(url, entity, String.class);
+                            
+                            JsonNode root = objectMapper.readTree(responseStr);
+                            JsonNode embeddingNode = root.path("embedding");
+                            
+                            if (embeddingNode.isObject()) {
+                                JsonNode valuesNode = embeddingNode.path("values");
+                                if (valuesNode.isArray()) {
+                                    float[] vector = new float[valuesNode.size()];
+                                    for (int i = 0; i < valuesNode.size(); i++) {
+                                        vector[i] = (float) valuesNode.get(i).asDouble();
+                                    }
+                                    resultEmbedding = Embedding.from(vector);
+                                }
+                            } else {
+                                throw new RuntimeException("Failed to extract embedding from Gemini response: " + responseStr);
+                            }
+                            
+                            success = true;
+                            // Small delay to prevent hammering the API too violently in parallel
+                            Thread.sleep(50);
+                            
+                        } catch (org.springframework.web.client.HttpStatusCodeException e) {
+                            if (e.getStatusCode().value() == 429) {
+                                retries++;
+                                log.warn("Rate limit hit (429)! Thread waiting 16 seconds before retry {}/3...", retries);
+                                try {
+                                    Thread.sleep(16000);
+                                } catch (InterruptedException ie) {
+                                    Thread.currentThread().interrupt();
+                                }
+                            } else {
+                                log.error("HTTP Error from Gemini: {} - {}", e.getStatusCode(), e.getResponseBodyAsString(), e);
+                                throw new RuntimeException("Gemini API Error: " + e.getResponseBodyAsString(), e);
+                            }
+                        } catch (Exception e) {
+                            log.error("Failed to generate embedding: {}", e.getMessage(), e);
+                            throw new RuntimeException("Failed to generate embedding: " + e.getMessage(), e);
                         }
-                    } else {
-                        log.error("HTTP Error from Gemini: {} - {}", e.getStatusCode(), e.getResponseBodyAsString(), e);
-                        throw new RuntimeException("Gemini API Error: " + e.getResponseBodyAsString(), e);
                     }
-                } catch (Exception e) {
-                    log.error("Failed to generate embedding: {}", e.getMessage(), e);
-                    throw new RuntimeException("Failed to generate embedding: " + e.getMessage(), e);
-                }
+                    
+                    if (!success) {
+                        throw new RuntimeException("Failed to generate embedding after 3 retries due to rate limits.");
+                    }
+                    return resultEmbedding;
+                }));
             }
             
-            if (!success) {
-                throw new RuntimeException("Failed to generate embedding after 3 retries due to rate limits.");
+            // Collect the results in the exact same order
+            for (var future : futures) {
+                allEmbeddings.add(future.get());
             }
+            
+        } catch (Exception e) {
+            log.error("Failed to execute concurrent embedding requests", e);
+            throw new RuntimeException("Failed to execute concurrent embedding requests", e);
         }
 
         return Response.from(allEmbeddings);
